@@ -1,0 +1,196 @@
+/*******************************************************************************
+ * Copyright (c) 2016-2017 Red Hat Inc. and others.
+ * All rights reserved. This program and the accompanying materials
+ * are made available under the terms of the Eclipse Public License 2.0
+ * which accompanies this distribution, and is available at
+ * https://www.eclipse.org/legal/epl-2.0/
+ *
+ * SPDX-License-Identifier: EPL-2.0
+ *
+ * Contributors:
+ *     Red Hat Inc. - initial API and implementation
+ *******************************************************************************/
+package org.eclipse.jdt.ls.core.internal.managers;
+
+import static org.eclipse.core.resources.IProjectDescription.DESCRIPTION_FILE_NAME;
+
+import java.io.File;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+import org.eclipse.core.resources.IProject;
+import org.eclipse.core.resources.IProjectDescription;
+import org.eclipse.core.resources.IResource;
+import org.eclipse.core.resources.IWorkspace;
+import org.eclipse.core.resources.ResourcesPlugin;
+import org.eclipse.core.runtime.CoreException;
+import org.eclipse.core.runtime.IPath;
+import org.eclipse.core.runtime.IProgressMonitor;
+import org.eclipse.core.runtime.IStatus;
+import org.eclipse.core.runtime.Path;
+import org.eclipse.core.runtime.Platform;
+import org.eclipse.core.runtime.SubMonitor;
+import org.eclipse.jdt.core.IJavaProject;
+import org.eclipse.jdt.core.JavaCore;
+import org.eclipse.jdt.ls.core.internal.AbstractProjectImporter;
+import org.eclipse.jdt.ls.core.internal.JavaLanguageServerPlugin;
+import org.eclipse.jdt.ls.core.internal.ProjectUtils;
+
+public class EclipseProjectImporter extends AbstractProjectImporter {
+
+	@Override
+	public boolean applies(IProgressMonitor monitor) throws CoreException {
+		if (directories == null) {
+			BasicFileDetector eclipseDetector = new BasicFileDetector(rootFolder.toPath(), DESCRIPTION_FILE_NAME)
+					.addExclusions("**/bin");//default Eclipse build dir
+			for (IProject project : ProjectUtils.getAllProjects(false)) {
+				File projectFile = project.getLocation().toFile();
+				/**
+				 * The exclusion pattern will be used as a regular expression
+				 * that matches the files or folders to be excluded. On Windows,
+				 * the path separator (\) is a special character in regular
+				 * expressions, so it needs to be escaped with another backslash (\)
+				 * to be treated literally. For example, to exclude the folder
+				 * C:\Users\Hello, the exclusion pattern should be C:\\Users\\Hello.
+				 */
+				eclipseDetector.addExclusions(projectFile.getAbsolutePath().replace("\\", "\\\\"));
+			}
+			directories = eclipseDetector.scan(monitor);
+		}
+		directories = directories.stream().filter(path -> (new File(path.toFile(), IJavaProject.CLASSPATH_FILE_NAME).exists())).collect(Collectors.toList());
+		return !directories.isEmpty();
+	}
+
+	@Override
+	public boolean applies(Collection<IPath> buildFiles, IProgressMonitor monitor) {
+		Collection<java.nio.file.Path> configurationDirs = findProjectPathByConfigurationName(buildFiles, Arrays.asList(DESCRIPTION_FILE_NAME), true /*includeNested*/);
+		if (configurationDirs == null || configurationDirs.isEmpty()) {
+			return false;
+		}
+
+		Set<java.nio.file.Path> importedProjectPaths = new HashSet<>();
+		for (IProject project : ProjectUtils.getAllProjects()) {
+			importedProjectPaths.add(project.getLocation().toFile().toPath());
+		}
+
+		this.directories = configurationDirs.stream()
+			.filter(d -> {
+				boolean folderIsImported = importedProjectPaths.stream().anyMatch(path -> {
+					return path.compareTo(d) == 0;
+				});
+				return !folderIsImported;
+			})
+			.collect(Collectors.toList());
+
+		this.directories = this.directories.stream().filter(path -> (new File(path.toFile(), IJavaProject.CLASSPATH_FILE_NAME).exists())).collect(Collectors.toList());
+		return !this.directories.isEmpty();
+	}
+
+	@Override
+	public void reset() {
+		directories = null;
+	}
+
+	public void setDirectories(Collection<java.nio.file.Path> paths) {
+		directories = paths;
+	}
+
+
+	@Override
+	public void importToWorkspace(IProgressMonitor monitor) throws CoreException {
+		if (!applies(monitor)) {
+			return;
+		}
+		SubMonitor subMonitor = SubMonitor.convert(monitor, directories.size());
+		JavaLanguageServerPlugin.logInfo("Importing Eclipse project(s)");
+		directories.forEach(d -> importDir(d, subMonitor.newChild(1)));
+		subMonitor.done();
+	}
+
+	private void importDir(java.nio.file.Path dir, IProgressMonitor m) {
+		SubMonitor monitor = SubMonitor.convert(m, 4);
+		IWorkspace workspace = ResourcesPlugin.getWorkspace();
+		IPath dotProjectPath = new Path(dir.resolve(DESCRIPTION_FILE_NAME).toAbsolutePath().toString());
+		IProjectDescription descriptor;
+		String name = null;
+		try {
+			descriptor = workspace.loadProjectDescription(dotProjectPath);
+			name = descriptor.getName();
+			if (!descriptor.hasNature(JavaCore.NATURE_ID)) {
+				return;
+			}
+			IProject project = workspace.getRoot().getProject(name);
+			if (project.exists()) {
+				IPath existingProjectPath = project.getLocation();
+				existingProjectPath = fixDevice(existingProjectPath);
+				dotProjectPath = fixDevice(dotProjectPath);
+				if (existingProjectPath.equals(dotProjectPath.removeLastSegments(1))) {
+					project.open(IResource.NONE, monitor.newChild(1));
+					project.refreshLocal(IResource.DEPTH_INFINITE, monitor.newChild(1));
+					return;
+				} else {
+					project = findUniqueProject(workspace, name);
+					descriptor.setName(project.getName());
+				}
+			}
+			project.create(descriptor, monitor.newChild(1));
+			project.open(IResource.NONE, monitor.newChild(1));
+		} catch (CoreException e) {
+			IStatus status = e.getStatus();
+			if (status != null && status.isMultiStatus()) {
+				for (IStatus child : status.getChildren()) {
+					logStatus("Failed to import Eclipse project '" + name + "'.", child);
+				}
+			} else {
+				logStatus("Failed to import Eclipse project '" + name + "'.", status);
+			}
+			throw new RuntimeException(e);
+		} finally {
+			monitor.done();
+		}
+	}
+
+	private void logStatus(String message, IStatus status) {
+		if (status == null) {
+			return;
+		}
+
+		if (!status.isOK() && status.getSeverity() >= IStatus.ERROR) {
+			if (status.getException() != null) {
+				JavaLanguageServerPlugin.logException(message, status.getException());
+			} else {
+				JavaLanguageServerPlugin.logError(message + " " + status.getMessage());
+			}
+			return;
+		}
+
+		JavaLanguageServerPlugin.log(status);
+	}
+
+	private IPath fixDevice(IPath path) {
+		if (path != null && path.getDevice() != null) {
+			return path.setDevice(path.getDevice().toUpperCase());
+		}
+		if (Platform.OS_WIN32.equals(Platform.getOS()) && path != null && path.toString().startsWith("//")) {
+			String server = path.segment(0);
+			String pathStr = path.toString().replace(server, server.toUpperCase());
+			return new Path(pathStr);
+		}
+		return path;
+	}
+
+	//XXX should be package protected. Temporary fix (ahaha!) until test fragment can work in tycho builds
+	public IProject findUniqueProject(IWorkspace workspace, String basename) {
+		IProject project = null;
+		String name;
+		for (int i = 1; project == null || project.exists(); i++) {
+			name = (i < 2)? basename:basename + " ("+ i +")";
+			project = workspace.getRoot().getProject(name);
+		}
+		return project;
+	}
+
+}

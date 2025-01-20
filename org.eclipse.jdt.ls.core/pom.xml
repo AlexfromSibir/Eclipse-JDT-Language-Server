@@ -1,0 +1,133 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+	<modelVersion>4.0.0</modelVersion>
+	<parent>
+		<groupId>org.eclipse.jdt.ls</groupId>
+		<artifactId>parent</artifactId>
+		<version>1.44.0-SNAPSHOT</version>
+	</parent>
+	<artifactId>org.eclipse.jdt.ls.core</artifactId>
+	<packaging>eclipse-plugin</packaging>
+	<name>${base.name} :: Core</name>
+	<build>
+		<plugins>
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-dependency-plugin</artifactId>
+				<configuration>
+					<artifactItems>
+						<artifactItem>
+							<groupId>com.kotcrab.remark</groupId>
+							<artifactId>remark</artifactId>
+							<version>1.2.0</version>
+						</artifactItem>
+						<artifactItem>
+							<groupId>org.jsoup</groupId>
+							<artifactId>jsoup</artifactId>
+							<version>1.14.2</version>
+						</artifactItem>
+						<artifactItem>
+							<groupId>com.jetbrains.intellij.java</groupId>
+							<artifactId>java-decompiler-engine</artifactId>
+							<version>231.9011.34</version>
+						</artifactItem>
+					</artifactItems>
+				</configuration>
+			</plugin>
+			<plugin>
+				<groupId>org.codehaus.gmaven</groupId>
+				<artifactId>groovy-maven-plugin</artifactId>
+				<version>2.1.1</version>
+				<executions>
+					<execution>
+						<?m2e ignore?>
+						<phase>generate-resources</phase>
+						<goals>
+							<goal>execute</goal>
+						</goals>
+						<configuration>
+							<source>
+								import groovy.json.JsonSlurper
+								import groovy.json.JsonOutput
+
+								import java.net.http.HttpClient
+								import java.net.http.HttpRequest
+								import java.net.http.HttpResponse.BodyHandlers
+								import java.util.concurrent.CompletableFuture
+								import java.util.stream.Collectors;
+
+
+								def checksumsFile = new File(project.basedir.absolutePath, "gradle/checksums/checksums.json")
+								if (System.getProperty("eclipse.jdt.ls.skipGradleChecksums") != null &amp;&amp; checksumsFile.exists()) {
+									println "Skipping gradle wrapper validation checksums ..."
+									return
+								}
+
+								def versionUrl = new URL("https://services.gradle.org/versions/all")
+								def versionStr = versionUrl.text;
+								def versionsFile = new File(project.basedir.absolutePath, "gradle/checksums/versions.json")
+								versionsFile.parentFile.mkdirs() //just in case
+								versionsFile.write(versionStr)
+								println "Wrote to ${versionsFile}"
+
+								def versions = new JsonSlurper().parseText(versionStr)
+
+								class Checksum {
+									String wrapperChecksumUrl;
+									String sha256
+								}
+								HttpClient client = HttpClient.newHttpClient()
+								def futures = []
+								versions.each {
+									if (it.wrapperChecksumUrl == null) {
+										return
+									}
+									HttpRequest request = HttpRequest.newBuilder().uri(URI.create(it.wrapperChecksumUrl)).build()
+									futures.add(client.sendAsync(request, BodyHandlers.ofString()).thenApply { response ->
+										if (response.statusCode() == 301) {
+											String newUrl = response.headers().firstValue("location").orElse(null)
+											if (newUrl != null) {
+												HttpRequest newRequest = HttpRequest.newBuilder()
+														.uri(URI.create(newUrl))
+														.build()
+												try {
+													String sha256 = client.send(newRequest, BodyHandlers.ofString()).body()
+													return new Checksum(wrapperChecksumUrl: it.wrapperChecksumUrl, sha256: sha256)
+												} catch (IOException | InterruptedException e) {
+													return null
+												}
+											} else {
+												return null
+											}
+										} else {
+											// Return the body of the original response
+											return new Checksum(wrapperChecksumUrl: it.wrapperChecksumUrl, sha256: response.body())
+										}
+									})
+								}
+
+								def checksums = CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
+										.thenApply { v ->
+											futures.stream().map({ f ->
+												f.join()
+											}).collect(Collectors.toList())
+										}.get()
+
+								def json = JsonOutput.toJson(checksums)
+								checksumsFile.write(JsonOutput.prettyPrint(json))
+								println "Wrote to ${checksumsFile}"
+							</source>
+						</configuration>
+					</execution>
+				</executions>
+			</plugin>
+		</plugins>
+	</build>
+	<repositories>
+		<repository>
+			<id>jetbrains-intellij</id>
+			<url>https://www.jetbrains.com/intellij-repository/releases/</url>
+		</repository>
+	</repositories>
+</project>
